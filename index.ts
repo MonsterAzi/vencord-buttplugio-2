@@ -621,64 +621,85 @@ async function checkDeviceBattery() {
 }
 
 async function addToVibrateQueue(data: VibrateEvent) {
+    // Add the VibrateEvent to the queue
     vibrateQueue.push(data);
+    // Check that there's only a single event in the queue
     if (vibrateQueue.length === 1) {
         processVibrateQueue();
     }
 }
 
 async function processVibrateQueue() {
+    // Check if the vibrate queue is empty
     if (vibrateQueue.length === 0) {
+        // If the queue is empty, return immediately
         return;
     }
-
+    // Get the first item from the queue
     const data = vibrateQueue[0];
-
     try {
+        // Call the handleVibrate function with the current data
         await handleVibrate(data);
     } catch (error) {
+        // If an error occurs during handleVibrate, log the error
         console.error("Error in handleVibrate:", error);
     } finally {
+        // Remove the first item from the queue
         vibrateQueue.shift();
-
+        // Recursively call processVibrateQueue to process the next item
         processVibrateQueue();
     }
 }
 
-
 async function handleVibrate(data: VibrateEvent) {
+    // If client or client.devices is not defined, exit the function
     if (!client || !client.devices) {
         return;
     }
 
+    // If a specific device is not specified, use all connected devices
+    // Otherwise, use only the specified device
     const devices = data.deviceId ? [client.devices[data.deviceId]] : client.devices;
+    // If rampUpAndDown is not enabled in the plugin settings,
+    // vibrate the devices with the specified strength for the specified duration
+    // and then stop the vibration
     if (!pluginSettings.store.rampUpAndDown) {
         await vibrateDevices(devices, data.strength);
         await sleep(data.duration);
         stopDevices(devices);
     } else {
+        // If rampUpAndDown is enabled, get the number of ramp-up/ramp-down steps
         const steps = pluginSettings.store.rampUpAndDownSteps;
+        // Calculate the length of each ramp-up/ramp-down step
         const rampLength = data.duration * 0.2 / steps;
+        // Set the initial and final intensities for the ramp-up
         let startIntensity = 0;
         let endIntensity = data.strength;
+        // Calculate the intensity increment for each step
         let stepIntensity = (endIntensity - startIntensity) / steps;
 
+        // Perform the ramp-up by vibrating the devices with increasing intensity
+        // for the specified number of steps and duration
         for (let i = 0; i <= steps; i++) {
             await vibrateDevices(devices, startIntensity + (stepIntensity * i));
             await sleep(rampLength);
         }
-
+        // Wait for 54% of the specified duration
         await sleep(data.duration * 0.54);
-
+        
+        // Set the initial and final intensities for the ramp-down
         startIntensity = data.strength;
         endIntensity = 0;
-
+        // Calculate the intensity decrement for each step
         stepIntensity = (endIntensity - startIntensity) / steps;
 
+        // Perform the ramp-down by vibrating the devices with decreasing intensity
+        // for the specified number of steps and duration
         for (let i = 0; i <= steps; i++) {
             await vibrateDevices(devices, startIntensity + (stepIntensity * i));
             await sleep(rampLength);
         }
+        // Stop the vibration of the devices
         stopDevices(devices);
     }
 }
@@ -694,6 +715,72 @@ async function vibrateDevices(devices: ButtplugClientDevice[], intensity: number
     for (const device of devices) {
         await device.vibrate(intensity);
     }
+}
+
+// PROHE algorithm:
+function updateDeviceVibration(device: ButtplugClientDevice, touched: boolean) {
+    // Fetch the configuration settings
+	let config = fetchConfig()
+    // Get the current device status
+	let status = deviceStatus.get(device);
+    // If the device status is defined
+	if (status !== undefined) {
+        // Clear any existing timeout for the device
+		clearTimeout(status.timeout);
+        // Store the previous vibration level
+		const oldLevel = status.level;
+        // If the device is being touched
+		if (touched) {
+            // If the current level is less than the maximum and it's been long enough since the last threshold change
+			if (status.level < config.vibrationMax && new Date().valueOf() - status.lastThresholdChange.valueOf() > config.vibrationStepLength) {
+                // Increase the vibration level by the step size, up to the maximum
+				status.level = Math.min(status.level + config.vibrationStepSize, config.vibrationMax);
+                // Update the last threshold change time
+				status.lastThresholdChange = new Date();
+			}
+		} else {
+            // If the device is not touched, decrease the vibration level by the vibration step size
+            status.level -= config.vibrationStepSize;
+            // If the level is now less than or equal to zero, stop the vibration and return
+			if (status.level <= Number.EPSILON) {
+				stopDevice(device);
+				return;
+			}
+            // Update the last threshold change time
+			status.lastThresholdChange = new Date();
+		}
+        // Ensure the vibration level does not exceed the maximum
+		if (status.level > config.vibrationMax) {
+			status.level = config.vibrationMax
+		};
+        // Set a new timeout to call this function again after the vibration timeout
+		status.timeout = setTimeout(() => updateDeviceVibration(device, false), config.vibrationTimeout);
+        // If the vibration level has changed
+		if (status.level !== oldLevel) {
+            // Log the new level and update the device
+			console.debug(`Setting ${device.name} to ${status.level}`);
+			device.vibrate(status.level);
+		}
+        // Return to avoid creating a new device status
+		return;
+	}
+    // If the device status is undefined and the device is not touched, return
+	if (!touched) {
+		return;
+	}
+    // Log that we're starting vibration and create a new device status
+	console.debug(`Starting vibrating ${device.name} at ${config.vibrationStepSize}`);
+	deviceStatus.set(
+		device, {
+		level: config.vibrationStepSize,
+		timeout: setTimeout(
+			() => updateDeviceVibration(device, false),
+			config.vibrationTimeout
+		),
+		lastThresholdChange: new Date()
+	});
+    // Start vibrating the device at the initial step size
+	device.vibrate(config.vibrationStepSize);
 }
 
 interface FluxMessageCreate {
